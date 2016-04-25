@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 )
@@ -412,6 +413,14 @@ func (f Float) IsNA() bool {
 		return true
 	}
 	return false
+}
+
+func (f Float) IsZero() bool {
+	if f.IsNA() {
+		return true
+	} else {
+		return math.Abs(*f.f) < 0.00001
+	}
 }
 
 // Floats is a constructor for a Float array

@@ -1,6 +1,8 @@
 package df
 
 import (
+	"bytes"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"reflect"
@@ -47,11 +49,9 @@ type tobool interface {
 
 // DataFrame is the base data structure
 type DataFrame struct {
-	Columns  columns
-	colNames []string
-	colTypes []string
-	nCols    int
-	nRows    int
+	Columns   map[string]column
+	colIndexs map[string]int
+	nRows     int
 }
 
 // C represents a way to pass Colname and Elements to a DF constructor
@@ -109,9 +109,11 @@ func New(colConst ...C) (*DataFrame, error) {
 	}
 
 	var colLength int
-	colNames := []string{}
-	colTypes := []string{}
-	cols := columns{}
+	df := &DataFrame{
+		Columns:   map[string]column{},
+		colIndexs: map[string]int{},
+		nRows:     colLength,
+	}
 	for k, val := range colConst {
 		col, err := newCol(val.Colname, val.Elements)
 		if err != nil {
@@ -126,16 +128,8 @@ func New(colConst ...C) (*DataFrame, error) {
 				return nil, errors.New("columns don't have the same dimensions")
 			}
 		}
-		cols = append(cols, *col)
-		colNames = append(colNames, col.colName)
-		colTypes = append(colTypes, col.colType)
-	}
-	df := &DataFrame{
-		colNames: colNames,
-		colTypes: colTypes,
-		Columns:  cols,
-		nRows:    colLength,
-		nCols:    len(colNames),
+		df.Columns[val.Colname] = *col
+		df.colIndexs[val.Colname] = k + 1
 	}
 
 	return df, nil
@@ -143,43 +137,49 @@ func New(colConst ...C) (*DataFrame, error) {
 
 // Names is the getter method for the column names
 func (df DataFrame) Names() []string {
-	return df.colNames
+	var names []string
+	for _, v := range df.Columns {
+		names = append(names, v.colName)
+	}
+	return names
 }
 
 func (df DataFrame) copy() DataFrame {
-	colnames := make([]string, len(df.colNames))
-	for k, v := range df.colNames {
-		colnames[k] = v
-	}
-	coltypes := make([]string, len(df.colTypes))
-	for k, v := range df.colTypes {
-		coltypes[k] = v
-	}
-	columns := make(columns, len(df.Columns))
+	columns := make(map[string]column)
 	for k, v := range df.Columns {
 		columns[k] = v.copy()
 	}
 	dfc := DataFrame{
-		colNames: colnames,
-		colTypes: coltypes,
-		Columns:  columns,
-		nRows:    df.nRows,
-		nCols:    df.nCols,
+		Columns:   columns,
+		colIndexs: df.colIndexs,
+		nRows:     df.nRows,
 	}
 	return dfc
 }
 
 // SetNames let us specify the column names of a DataFrame
 func (df *DataFrame) SetNames(colnames []string) error {
-	if len(df.colNames) != len(colnames) {
-		return errors.New("Different sizes for colnames array")
-	}
+	newcolumns := make(map[string]column)
+	newindexes := make(map[string]int)
 
-	for k := range df.Columns {
-		df.Columns[k].colName = colnames[k]
-		df.Columns[k].recountNumChars()
-		df.colNames[k] = colnames[k]
+	for k, v := range df.colIndexs {
+		if v < len(colnames) {
+			if _, ok := newcolumns[colnames[v]]; ok {
+				return errors.New("duplicate column name: " + colnames[v])
+			}
+			newcolumns[colnames[v]] = df.Columns[k]
+			newindexes[colnames[v]] = v
+		} else {
+			newcolumns[k] = df.Columns[k]
+			newindexes[k] = v
+		}
+
+		if col, ok := df.Columns[k]; ok {
+			col.recountNumChars()
+		}
 	}
+	df.Columns = newcolumns
+	df.colIndexs = newindexes
 	return nil
 }
 
@@ -223,13 +223,11 @@ func (df *DataFrame) LoadData(records [][]string) error {
 
 	// Generate a df to store the temporary values
 	newDf := DataFrame{
-		nRows:    nRows,
-		nCols:    nCols,
-		colNames: colnames,
-		colTypes: []string{},
+		nRows:     nRows,
+		Columns:   map[string]column{},
+		colIndexs: map[string]int{},
 	}
 
-	cols := columns{}
 	// Fill the columns on the DataFrame
 	for j := 0; j < nCols; j++ {
 		colstrarr := []string{}
@@ -241,13 +239,146 @@ func (df *DataFrame) LoadData(records [][]string) error {
 		if err != nil {
 			return err
 		}
-
-		cols = append(cols, *col)
-		newDf.colTypes = append(newDf.colTypes, col.colType)
+		newDf.Columns[colnames[j]] = *col
+		newDf.colIndexs[colnames[j]] = j
 	}
 
-	newDf.Columns = cols
 	*df = newDf
+	return nil
+}
+
+func (df *DataFrame) LoadJson(jdata []map[string]interface{}) error {
+	data := make([][]string, 1)
+	index := make(map[string]int)
+
+	for _, row := range jdata {
+		rdata := make([]string, len(index))
+		for k, v := range row {
+			if idx, ok := index[k]; ok {
+				rdata[idx] = fmt.Sprint(v)
+			} else {
+				index[k] = len(index)
+				data[0] = append(data[0], k)
+				for j := 1; j < len(data); j++ {
+					data[j] = append(data[j], "")
+				}
+				rdata = append(rdata, fmt.Sprint(v))
+			}
+		}
+		data = append(data, rdata)
+	}
+
+	return df.LoadData(data)
+}
+
+func (df *DataFrame) LoadCsv(data []byte) error {
+	r := csv.NewReader(bytes.NewReader(data))
+	records, err := r.ReadAll()
+	if err != nil {
+		return err
+	}
+
+	return df.LoadData(records)
+}
+
+// LoadData will load the data from a multidimensional array of strings into
+// a DataFrame object.
+func (df *DataFrame) LoadInterface(records [][]interface{}, colnames []string) error {
+	// Calculate DataFrame dimensions
+	nRows := len(records)
+	if nRows <= 0 {
+		return errors.New("Empty dataframe")
+	}
+	nCols := len(colnames)
+
+	// If colNames has empty elements we must fill it with unique colnames
+	colnamesMap := make(map[string]bool)
+	auxCounter := 0
+	// Get unique columnenames
+	for _, v := range colnames {
+		if v != "" {
+			if _, ok := colnamesMap[v]; !ok {
+				colnamesMap[v] = true
+			} else {
+				return errors.New("Duplicated column names: " + v)
+			}
+		}
+	}
+	for k, v := range colnames {
+		if v == "" {
+			for {
+				newColname := fmt.Sprint("V", auxCounter)
+				auxCounter++
+				if _, ok := colnamesMap[newColname]; !ok {
+					colnames[k] = newColname
+					colnamesMap[newColname] = true
+					break
+				}
+			}
+		}
+	}
+
+	// Generate a df to store the temporary values
+	newDf := DataFrame{
+		nRows:     nRows,
+		Columns:   map[string]column{},
+		colIndexs: map[string]int{},
+	}
+
+	// Fill the columns on the DataFrame
+	for j := 0; j < nCols; j++ {
+		colstrarr := []string{}
+		for i := 0; i < nRows; i++ {
+			colstrarr = append(colstrarr, fmt.Sprint(records[i][j]))
+		}
+
+		col, err := newCol(colnames[j], Strings(colstrarr))
+		if err != nil {
+			return err
+		}
+
+		newDf.Columns[colnames[j]] = *col
+		newDf.colIndexs[colnames[j]] = j
+	}
+
+	*df = newDf
+
+	types := make([]string, len(colnames))
+	for i := 0; i < nCols; i++ {
+		types[i] = reflect.TypeOf(records[0][i]).String()
+	}
+	df.Parse(types)
+	return nil
+}
+
+func (df *DataFrame) Parse(types interface{}) error {
+	// Parse the DataFrame columns acording to the given types
+	switch types.(type) {
+	case []string:
+		types := types.([]string)
+		for k, v := range df.colIndexs {
+			if v < len(types) {
+				col := df.Columns[k].copy()
+				err := col.ParseColumn(types[v])
+				if err != nil {
+					return nil
+				}
+				df.Columns[k] = col
+			}
+		}
+	case T:
+		types := types.(T)
+		for k, v := range types {
+			col := df.Columns[k].copy()
+			err := col.ParseColumn(v)
+			if err != nil {
+				return err
+			}
+
+			df.Columns[k] = col
+		}
+	}
+
 	return nil
 }
 
@@ -261,57 +392,23 @@ func (df *DataFrame) LoadAndParse(records [][]string, types interface{}) error {
 	if err != nil {
 		return err
 	}
-
-	// Parse the DataFrame columns acording to the given types
-	switch types.(type) {
-	case []string:
-		types := types.([]string)
-		if df.nCols != len(types) {
-			return errors.New("Number of columns different from number of types")
-		}
-		for k := range df.Columns {
-			col := df.Columns[k].copy()
-			err := col.ParseColumn(types[k])
-			if err != nil {
-				return err
-			}
-			df.colTypes[k] = col.colType
-		}
-	case T:
-		types := types.(T)
-		for k, v := range types {
-			i, err := df.colIndex(k)
-			if err != nil {
-				return err
-			}
-			col := df.Columns[*i].copy()
-			err = col.ParseColumn(v)
-			if err != nil {
-				return err
-			}
-			colIndex, _ := df.colIndex(k)
-			df.colTypes[*colIndex] = col.colType
-			df.Columns[*colIndex] = col
-		}
-	}
-
-	return nil
+	return df.Parse(types)
 }
 
 // SaveRecords will save data to records in [][]string format
 func (df DataFrame) SaveRecords() [][]string {
-	if df.nCols == 0 {
+	if len(df.Columns) == 0 {
 		return make([][]string, 0)
 	}
 	if df.nRows == 0 {
 		records := make([][]string, 1)
-		records[0] = df.colNames
+		records[0] = df.Names()
 		return records
 	}
 
 	var records [][]string
 
-	records = append(records, df.colNames)
+	records = append(records, df.Names())
 	for i := 0; i < df.nRows; i++ {
 		r := []string{}
 		for _, v := range df.Columns {
@@ -330,7 +427,7 @@ func (df DataFrame) SaveRecords() [][]string {
 // columns.
 func (df DataFrame) Dim() (dim [2]int) {
 	dim[0] = df.nRows
-	dim[1] = df.nCols
+	dim[1] = len(df.Columns)
 	return
 }
 
@@ -341,17 +438,15 @@ func (df DataFrame) NRows() int {
 
 // NCols is the getter method for the number of rows in a DataFrame
 func (df DataFrame) NCols() int {
-	return df.nCols
+	return len(df.Columns)
 }
 
 // colIndex tries to find the column index for a given column name
-func (df DataFrame) colIndex(colname string) (*int, error) {
-	for k, v := range df.colNames {
-		if v == colname {
-			return &k, nil
-		}
+func (df DataFrame) colIndex(colname string) (int, error) {
+	if v, ok := df.colIndexs[colname]; ok {
+		return v, nil
 	}
-	return nil, errors.New("Can't find the given column:")
+	return 0, errors.New("Can't find the given column:")
 }
 
 // Subset will return a DataFrame that contains only the columns and rows contained
@@ -369,108 +464,119 @@ func (df DataFrame) Subset(subsetCols interface{}, subsetRows interface{}) (*Dat
 	return dfB, nil
 }
 
+func (df DataFrame) DropColumn(col string) (*DataFrame, error) {
+	var newcolnames []string
+	for _, c := range df.Columns {
+		if col != c.colName {
+			newcolnames = append(newcolnames, col)
+		}
+	}
+
+	return df.SubsetColumns(newcolnames)
+}
+
 // SubsetColumns will return a DataFrame that contains only the columns contained
 // on the given subset
 func (df DataFrame) SubsetColumns(subset interface{}) (*DataFrame, error) {
 	// Generate a DataFrame to store the temporary values
-	newDf := df.copy()
-
 	switch subset.(type) {
 	case R:
 		s := subset.(R)
-		// Check for errors
-		if s.From > s.To {
-			return nil, errors.New("Bad subset: Start greater than Beginning")
+		var cols []string
+		for k, v := range df.colIndexs {
+			if v >= s.From && v < s.To {
+				cols = append(cols, k)
+			}
 		}
-		if s.From == s.To {
-			return nil, errors.New("Empty subset")
-		}
-		if s.To > df.nCols || s.To < 0 || s.From < 0 {
-			return nil, errors.New("Subset out of range")
-		}
-
-		newDf.nCols = s.To - s.From
-		newDf.colNames = newDf.colNames[s.From:s.To]
-		newDf.colTypes = newDf.colTypes[s.From:s.To]
-		newDf.Columns = newDf.Columns[s.From:s.To]
+		return df.SubsetColumns(cols)
 	case []int:
 		colNums := subset.([]int)
-		if len(colNums) == 0 {
-			return nil, errors.New("Empty subset")
-		}
-
 		// Check for errors
 		colNumsMap := make(map[int]bool)
 		for _, v := range colNums {
-			if v >= newDf.nCols || v < 0 {
-				return nil, errors.New("Subset out of range")
+			colNumsMap[v] = true
+		}
+
+		var cols []string
+		for k, v := range df.colIndexs {
+			if _, ok := colNumsMap[v]; ok {
+				cols = append(cols, k)
 			}
-			if _, ok := colNumsMap[v]; !ok {
-				colNumsMap[v] = true
-			} else {
-				return nil, errors.New("Duplicated column numbers")
+		}
+		return df.SubsetColumns(cols)
+	case []string:
+		cols := subset.([]string)
+
+		colindex := map[string]int{}
+		for _, v := range cols {
+			if idx, ok := df.colIndexs[v]; ok {
+				colindex[v] = idx
 			}
 		}
 
-		cols := columns{}
-		colNames := []string{}
-		colTypes := []string{}
-		for _, v := range colNums {
-			col := newDf.Columns[v]
-			cols = append(cols, col)
-			colNames = append(colNames, newDf.colNames[v])
-			colTypes = append(colTypes, newDf.colTypes[v])
-		}
-		newDf.Columns = cols
-		newDf.colNames = colNames
-		newDf.colTypes = colTypes
-	case []string:
-		cols := subset.([]string)
-		if len(cols) == 0 {
+		if len(colindex) == 0 {
 			return nil, errors.New("Empty subset")
 		}
 
-		// Check for duplicated cols
-		colnamesMap := make(map[string]bool)
-		dupedColnames := []string{}
-		for _, v := range cols {
-			if v != "" {
-				if _, ok := colnamesMap[v]; !ok {
-					colnamesMap[v] = true
-				} else {
-					dupedColnames = append(dupedColnames, v)
+		newDf := df.copy()
+		for k, v := range df.colIndexs {
+			if _, ok := colindex[k]; !ok {
+				delete(newDf.Columns, k)
+
+				for kk, vv := range colindex {
+					if df.colIndexs[kk] > v {
+						colindex[kk] = vv - 1
+					}
 				}
 			}
-		}
-		if len(dupedColnames) != 0 {
-			return nil, errors.New(fmt.Sprint("Duplicated column names:", dupedColnames))
-		}
 
-		// Select the desired subset of columns
-		columns := columns{}
-		colNames := []string{}
-		colTypes := []string{}
-		for _, v := range cols {
-			i, err := newDf.colIndex(v)
-			if err != nil {
-				return nil, err
-			}
-
-			col := newDf.Columns[*i]
-			columns = append(columns, col)
-			colNames = append(colNames, v)
-			colTypes = append(colTypes, newDf.colTypes[*i])
 		}
-		newDf.Columns = columns
-		newDf.colNames = colNames
-		newDf.colTypes = colTypes
+		return &newDf, nil
+
 	default:
 		return nil, errors.New("Unknown subsetting option")
 	}
+}
 
-	newDf.nCols = len(newDf.colNames)
+func (df DataFrame) FilterRows(colname string, f func(Cell) bool) (*DataFrame, error) {
+	if col, ok := df.Columns[colname]; ok {
+		var rows []int
 
-	return &newDf, nil
+		for i := 0; i < df.NRows(); i++ {
+			if f(col.cells[i]) {
+				rows = append(rows, i)
+			}
+		}
+
+		return df.SubsetRows(rows)
+	} else {
+		return nil, errors.New(colname + " not exists")
+	}
+}
+
+func (df DataFrame) ConditionRows(cs map[string]Condition) (*DataFrame, error) {
+	if len(cs) == 0 {
+		newDf := df.copy()
+		return &newDf, nil
+	}
+
+	var rows []int
+
+	for i := 0; i < df.NRows(); i++ {
+		valid := true
+		for k, c := range cs {
+			if !c.Compare(df.Columns[k].cells[i], df.Columns[k].colType) {
+				valid = false
+				break
+			}
+		}
+
+		if valid {
+			rows = append(rows, i)
+		}
+	}
+
+	return df.SubsetRows(rows)
 }
 
 // SubsetRows will return a DataFrame that contains only the selected rows
@@ -493,16 +599,14 @@ func (df DataFrame) SubsetRows(subset interface{}) (*DataFrame, error) {
 		}
 
 		newDf.nRows = s.To - s.From
-		columns := columns{}
-		for _, v := range newDf.Columns {
+		for k, v := range df.Columns {
 			col, err := newCol(v.colName, v.cells[s.From:s.To])
 			if err != nil {
 				return nil, err
 			}
 			col.recountNumChars()
-			columns = append(columns, *col)
+			newDf.Columns[k] = *col
 		}
-		newDf.Columns = columns
 	case []int:
 		rowNums := subset.([]int)
 
@@ -518,8 +622,7 @@ func (df DataFrame) SubsetRows(subset interface{}) (*DataFrame, error) {
 		}
 
 		newDf.nRows = len(rowNums)
-		columns := columns{}
-		for _, v := range newDf.Columns {
+		for k, v := range df.Columns {
 			cells := Cells{}
 
 			for _, i := range rowNums {
@@ -536,9 +639,8 @@ func (df DataFrame) SubsetRows(subset interface{}) (*DataFrame, error) {
 			}
 
 			col.recountNumChars()
-			columns = append(columns, *col)
+			newDf.Columns[k] = *col
 		}
-		newDf.Columns = columns
 	default:
 		return nil, errors.New("Unknown subsetting option")
 	}
@@ -548,78 +650,54 @@ func (df DataFrame) SubsetRows(subset interface{}) (*DataFrame, error) {
 
 // Rbind combines the rows of two dataframes
 func Rbind(a DataFrame, b DataFrame) (*DataFrame, error) {
-	dfa := a.copy()
-	dfb := b.copy()
-	// Check that the given DataFrame contains the same number of columns that the
-	// current dataframe.
-	if dfa.nCols != dfb.nCols {
-		return nil, errors.New("Different number of columns")
+	newDf := &DataFrame{
+		nRows:     a.nRows + b.nRows,
+		colIndexs: a.colIndexs,
+		Columns:   map[string]column{},
 	}
 
-	// Check that the names and the types of all columns are the same
-	colNameTypeMap := make(map[string]string)
-	for k, v := range dfa.colNames {
-		colNameTypeMap[v] = dfa.colTypes[k]
-	}
-
-	for k, v := range dfb.colNames {
-		if dfType, ok := colNameTypeMap[v]; ok {
-			if dfType != dfb.colTypes[k] {
-				return nil, errors.New("Mismatching column types")
-			}
-		} else {
+	for k, v := range a.colIndexs {
+		idx, ok := b.colIndexs[k]
+		if !ok || idx != v {
 			return nil, errors.New("Mismatching column names")
 		}
+
+		if a.Columns[k].colType != b.Columns[k].colType {
+			return nil, errors.New("Mismatching column types")
+		}
+
+		col := a.Columns[k].copy()
+		var err error
+		col, err = col.append(b.Columns[k].copy().cells...)
+		if err != nil {
+			return nil, err
+		}
+		newDf.Columns[k] = col
 	}
 
-	cols := columns{}
-	for _, v := range dfa.colNames {
-		i, err := dfa.colIndex(v)
-		if err != nil {
-			return nil, err
-		}
-		j, err := dfb.colIndex(v)
-		if err != nil {
-			return nil, err
-		}
-		col := dfa.Columns[*i]
-		col, err = col.append(dfb.Columns[*j].cells...)
-		if err != nil {
-			return nil, err
-		}
-		cols = append(cols, col)
-	}
-	dfa.Columns = cols
-	dfa.nRows += dfb.nRows
-
-	return &dfa, nil
+	return newDf, nil
 }
 
 // Cbind combines the columns of two DataFrames
 func Cbind(a DataFrame, b DataFrame) (*DataFrame, error) {
-	dfa := a.copy()
-	dfb := b.copy()
 	// Check that the two DataFrames contains the same number of rows
-	if dfa.nRows != dfb.nRows {
+	if a.nRows != b.nRows {
 		return nil, errors.New("Different number of rows")
 	}
 
-	// Check that the column names are unique when combined
-	colNameMap := make(map[string]bool)
-	for _, v := range dfa.colNames {
-		colNameMap[v] = true
-	}
+	dfa := a.copy()
+	dfb := b.copy()
 
-	for _, v := range dfb.colNames {
-		if _, ok := colNameMap[v]; ok {
+	for k, v := range dfb.Columns {
+		if _, ok := dfa.Columns[k]; ok {
 			return nil, errors.New("Conflicting column names")
 		}
+		dfa.Columns[k] = v
 	}
 
-	dfa.colNames = append(dfa.colNames, dfb.colNames...)
-	dfa.colTypes = append(dfa.colTypes, dfb.colTypes...)
-	dfa.nCols = len(dfa.colNames)
-	dfa.Columns = append(dfa.Columns, dfb.Columns...)
+	for k, v := range dfb.colIndexs {
+		dfa.colIndexs[k] = v + len(a.colIndexs)
+	}
 
 	return &dfa, nil
 }
@@ -721,10 +799,10 @@ func (df DataFrame) String() (str string) {
 	}
 
 	nRowsPadding := len(fmt.Sprint(df.nRows))
-	if len(df.colNames) != 0 {
+	if df.NCols() != 0 {
 		str += addLeftPadding("  ", nRowsPadding+2)
-		for k, v := range df.colNames {
-			str += addRightPadding(v, df.Columns[k].numChars)
+		for k, v := range df.Columns {
+			str += addRightPadding(v.colName, df.Columns[k].numChars)
 			str += "  "
 		}
 		str += "\n"
@@ -758,24 +836,25 @@ func formatCell(cell interface{}) string {
 
 // InnerJoin returns a DataFrame containing the inner join of two other DataFrames.
 // This operation matches all rows that appear on both dataframes.
+/*
 func InnerJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 	dfa := a.copy()
 	dfb := b.copy()
 	// Check that we have all given keys in both DataFrames
 	errorArr := []string{}
 	for _, key := range keys {
-		ia, erra := dfa.colIndex(key)
-		ib, errb := dfb.colIndex(key)
-		if erra != nil {
+		ca, oka := dfa.Columns[key]
+		cb, okb := dfb.Columns[key]
+		if !oka {
 			errorArr = append(errorArr, fmt.Sprint("Can't find key \"", key, "\" on left DataFrame"))
 		}
-		if errb != nil {
+		if !okb {
 			errorArr = append(errorArr, fmt.Sprint("Can't find key \"", key, "\" on right DataFrame"))
 		}
 		// Check that the column types are the same between DataFrames
-		if ia != nil && ib != nil {
-			ta := dfa.colTypes[*ia]
-			tb := dfb.colTypes[*ib]
+		if len(errorArr) == 0 {
+			ta := ca.colType
+			tb := cb.colType
 			if ta != tb {
 				errorArr = append(errorArr, fmt.Sprint("Different types for key\"", key, "\". Left:", ta, " Right:", tb))
 			}
@@ -786,19 +865,14 @@ func InnerJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 	}
 
 	// Rename non key coumns with the same name on both DataFrames
-	colnamesa := make([]string, len(dfa.colNames))
-	colnamesb := make([]string, len(dfb.colNames))
-	for k, v := range dfa.colNames {
-		colnamesa[k] = v
-	}
-	for k, v := range dfb.colNames {
-		colnamesb[k] = v
-	}
+	colnamesa := dfa.Names()
+	colnamesb := dfb.Names()
+
 	for k, v := range colnamesa {
 		if idx, err := dfb.colIndex(v); err == nil {
 			if !inStringSlice(v, keys) {
 				colnamesa[k] = v + ".x"
-				colnamesb[*idx] = v + ".y"
+				colnamesb[idx] = v + ".y"
 			}
 		}
 	}
@@ -812,8 +886,8 @@ func InnerJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 		ia, erra := dfa.colIndex(key)
 		ib, errb := dfb.colIndex(key)
 		if erra == nil && errb == nil {
-			colIdxa = append(colIdxa, *ia)
-			colIdxb = append(colIdxb, *ib)
+			colIdxa = append(colIdxa, ia)
+			colIdxb = append(colIdxb, ib)
 		}
 	}
 
@@ -851,9 +925,9 @@ func InnerJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 
 	// Get the names of the elements that are not keys on the right DataFrame
 	nokeynamesb := []string{}
-	for _, v := range dfb.colNames {
-		if !inStringSlice(v, keys) {
-			nokeynamesb = append(nokeynamesb, v)
+	for _, v := range dfb.Columns {
+		if !inStringSlice(v.colName, keys) {
+			nokeynamesb = append(nokeynamesb, v.colName)
 		}
 	}
 
@@ -867,17 +941,13 @@ func InnerJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 func CrossJoin(a DataFrame, b DataFrame) (*DataFrame, error) {
 	dfa := a.copy()
 	dfb := b.copy()
-	colnamesa := make([]string, len(dfa.colNames))
-	colnamesb := make([]string, len(dfb.colNames))
-	for k, v := range dfb.colNames {
-		colnamesb[k] = v
-	}
-	for k, v := range dfa.colNames {
-		if idx, err := dfb.colIndex(v); err == nil {
-			colnamesa[k] = v + ".x"
-			colnamesb[*idx] = v + ".y"
-		} else {
-			colnamesa[k] = v
+	colnamesa := dfa.Names()
+	colnamesb := dfb.Names()
+
+	for k, v := range dfa.Columns {
+		if idx, err := dfb.colIndex(v.colName); err == nil {
+			colnamesa[k] = v.colName + ".x"
+			colnamesb[idx] = v.colName + ".y"
 		}
 	}
 	dfa.SetNames(colnamesa)
@@ -917,9 +987,9 @@ func LeftJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 			errorArr = append(errorArr, fmt.Sprint("Can't find key \"", key, "\" on right DataFrame"))
 		}
 		// Check that the column types are the same between DataFrames
-		if ia != nil && ib != nil {
-			ta := dfa.colTypes[*ia]
-			tb := dfb.colTypes[*ib]
+		if len(errorArr) == 0 {
+			ta := dfa.Columns[ia].colType
+			tb := dfb.Columns[ib].colType
 			if ta != tb {
 				errorArr = append(errorArr, fmt.Sprint("Different types for key\"", key, "\". Left:", ta, " Right:", tb))
 			}
@@ -930,19 +1000,14 @@ func LeftJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 	}
 
 	// Rename non key coumns with the same name on both DataFrames
-	colnamesa := make([]string, len(dfa.colNames))
-	colnamesb := make([]string, len(dfb.colNames))
-	for k, v := range dfa.colNames {
-		colnamesa[k] = v
-	}
-	for k, v := range dfb.colNames {
-		colnamesb[k] = v
-	}
+	colnamesa := dfa.Names()
+	colnamesb := dfb.Names()
+
 	for k, v := range colnamesa {
 		if !inStringSlice(v, keys) {
 			if idx, err := dfb.colIndex(v); err == nil {
 				colnamesa[k] = v + ".x"
-				colnamesb[*idx] = v + ".y"
+				colnamesb[idx] = v + ".y"
 			}
 		}
 	}
@@ -956,8 +1021,8 @@ func LeftJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 		ia, erra := dfa.colIndex(key)
 		ib, errb := dfb.colIndex(key)
 		if erra == nil && errb == nil {
-			colIdxa = append(colIdxa, *ia)
-			colIdxb = append(colIdxb, *ib)
+			colIdxa = append(colIdxa, ia)
+			colIdxb = append(colIdxb, ib)
 		}
 	}
 
@@ -1002,9 +1067,9 @@ func LeftJoin(a DataFrame, b DataFrame, keys ...string) (*DataFrame, error) {
 
 	// Get the names of the elements that are not keys on the right DataFrame
 	nokeynamesb := []string{}
-	for _, v := range dfb.colNames {
-		if !inStringSlice(v, keys) {
-			nokeynamesb = append(nokeynamesb, v)
+	for _, v := range dfb.Columns {
+		if !inStringSlice(v.colName, keys) {
+			nokeynamesb = append(nokeynamesb, v.colName)
 		}
 	}
 
@@ -1032,9 +1097,9 @@ func RightJoin(b DataFrame, a DataFrame, keys ...string) (*DataFrame, error) {
 			errorArr = append(errorArr, fmt.Sprint("Can't find key \"", key, "\" on right DataFrame"))
 		}
 		// Check that the column types are the same between DataFrames
-		if ia != nil && ib != nil {
-			ta := dfa.colTypes[*ia]
-			tb := dfb.colTypes[*ib]
+		if len(errorArr) == 0 {
+			ta := dfa.Columns[ia].colType
+			tb := dfb.Columns[ib].colType
 			if ta != tb {
 				errorArr = append(errorArr, fmt.Sprint("Different types for key\"", key, "\". Left:", ta, " Right:", tb))
 			}
@@ -1045,19 +1110,14 @@ func RightJoin(b DataFrame, a DataFrame, keys ...string) (*DataFrame, error) {
 	}
 
 	// Rename non key coumns with the same name on both DataFrames
-	colnamesa := make([]string, len(dfa.colNames))
-	colnamesb := make([]string, len(dfb.colNames))
-	for k, v := range dfa.colNames {
-		colnamesa[k] = v
-	}
-	for k, v := range dfb.colNames {
-		colnamesb[k] = v
-	}
+	colnamesa := dfa.Names()
+	colnamesb := dfb.Names()
+
 	for k, v := range colnamesa {
 		if !inStringSlice(v, keys) {
 			if idx, err := dfb.colIndex(v); err == nil {
 				colnamesa[k] = v + ".y"
-				colnamesb[*idx] = v + ".x"
+				colnamesb[idx] = v + ".x"
 			}
 		}
 	}
@@ -1071,8 +1131,8 @@ func RightJoin(b DataFrame, a DataFrame, keys ...string) (*DataFrame, error) {
 		ia, erra := dfa.colIndex(key)
 		ib, errb := dfb.colIndex(key)
 		if erra == nil && errb == nil {
-			colIdxa = append(colIdxa, *ia)
-			colIdxb = append(colIdxb, *ib)
+			colIdxa = append(colIdxa, ia)
+			colIdxb = append(colIdxb, ib)
 		}
 	}
 
@@ -1117,13 +1177,27 @@ func RightJoin(b DataFrame, a DataFrame, keys ...string) (*DataFrame, error) {
 
 	// Get the names of the elements that are not keys on the right DataFrame
 	nokeynamesb := []string{}
-	for _, v := range dfb.colNames {
-		if !inStringSlice(v, keys) {
-			nokeynamesb = append(nokeynamesb, v)
+	for _, v := range dfb.Columns {
+		if !inStringSlice(v.colName, keys) {
+			nokeynamesb = append(nokeynamesb, v.colName)
 		}
 	}
 
 	newdfa, _ := dfa.SubsetRows(dfaIndexes)
 	newdfb, _ := dfb.Subset(nokeynamesb, dfbIndexes)
 	return Cbind(*newdfa, *newdfb)
+}
+*/
+
+func (d DataFrame) GetCell(colname string, row int) (Cell, string, error) {
+	col, ok := d.Columns[colname]
+	if !ok {
+		return nil, "", errors.New(colname + " not exsits")
+	}
+
+	if row >= d.NRows() {
+		return nil, "", errors.New("row out of range: " + fmt.Sprint(row))
+	}
+
+	return col.cells[row], col.colType, nil
 }

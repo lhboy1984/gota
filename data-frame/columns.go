@@ -14,8 +14,6 @@ type column struct {
 	empty    Cell
 }
 
-type columns []column
-
 // newCol is the constructor for a new Column with the given colName and elements
 func newCol(colName string, elements Cells) (*column, error) {
 	col := column{
